@@ -1,7 +1,7 @@
 import mlx.core as mx
 import pytest
 
-from mlx_lm.models.turboquant import solve_lloyd_max
+from mlx_lm.models.turboquant import generate_qjl_matrix, generate_rotation_matrix, solve_lloyd_max
 
 
 def test_placeholder():
@@ -43,3 +43,38 @@ class TestLloydMax:
         centroids, boundaries = solve_lloyd_max(d=128, bits=3)
         assert centroids.shape == (8,)
         assert boundaries.shape == (7,)
+
+
+class TestMatrixGeneration:
+    def test_rotation_is_orthogonal(self):
+        Pi = generate_rotation_matrix(d=128, seed=42)
+        identity = Pi @ Pi.T
+        expected = mx.eye(128)
+        assert mx.allclose(identity, expected, atol=1e-3).item()
+
+    def test_rotation_shape(self):
+        Pi = generate_rotation_matrix(d=128, seed=42)
+        assert Pi.shape == (128, 128)
+
+    def test_rotation_deterministic(self):
+        Pi1 = generate_rotation_matrix(d=128, seed=42)
+        Pi2 = generate_rotation_matrix(d=128, seed=42)
+        assert mx.allclose(Pi1, Pi2).item()
+
+    def test_rotation_different_seeds_differ(self):
+        Pi1 = generate_rotation_matrix(d=128, seed=42)
+        Pi2 = generate_rotation_matrix(d=128, seed=43)
+        assert not mx.allclose(Pi1, Pi2).item()
+
+    def test_qjl_matrix_shape(self):
+        S = generate_qjl_matrix(d=128, m=128, seed=42)
+        assert S.shape == (128, 128)
+
+    def test_qjl_matrix_different_m(self):
+        S = generate_qjl_matrix(d=128, m=64, seed=42)
+        assert S.shape == (64, 128)
+
+    def test_qjl_deterministic(self):
+        S1 = generate_qjl_matrix(d=128, m=128, seed=42)
+        S2 = generate_qjl_matrix(d=128, m=128, seed=42)
+        assert mx.allclose(S1, S2).item()

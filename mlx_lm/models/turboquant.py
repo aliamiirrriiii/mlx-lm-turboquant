@@ -8,6 +8,7 @@ import math
 from typing import Optional, Tuple
 
 import mlx.core as mx
+import numpy as np
 from scipy import integrate
 
 
@@ -67,3 +68,23 @@ def solve_lloyd_max(
         mx.array(centroids, dtype=mx.float32),
         mx.array(boundaries, dtype=mx.float32),
     )
+
+
+def generate_rotation_matrix(d: int, seed: int = 42) -> mx.array:
+    """Generate random orthogonal rotation matrix via QR decomposition of Gaussian matrix."""
+    rng = np.random.RandomState(seed)
+    G = rng.randn(d, d).astype(np.float32)
+    Q, R = np.linalg.qr(G)
+    diag_sign = np.sign(np.diag(R))
+    diag_sign[diag_sign == 0] = 1.0
+    Q = Q * diag_sign[np.newaxis, :]
+    return mx.array(Q, dtype=mx.float16)
+
+
+def generate_qjl_matrix(d: int, m: Optional[int] = None, seed: int = 42) -> mx.array:
+    """Generate random Gaussian projection matrix for QJL. Shape (m, d)."""
+    if m is None:
+        m = d
+    rng = np.random.RandomState(seed)
+    S = rng.randn(m, d).astype(np.float32)
+    return mx.array(S, dtype=mx.float16)
