@@ -191,6 +191,13 @@ def setup_arg_parser():
         default=None,
     )
     parser.add_argument(
+        "--kv-cache-type",
+        type=str,
+        choices=["standard", "quantized", "turboquant"],
+        default="standard",
+        help="KV cache type: standard (fp16), quantized (mx.quantize), or turboquant.",
+    )
+    parser.add_argument(
         "--kv-group-size",
         type=int,
         help="Group size for KV cache quantization.",
@@ -292,7 +299,12 @@ class GenerationResponse:
     finish_reason: Optional[str] = None
 
 
-def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
+def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits, kv_cache_type="standard"):
+    if kv_cache_type == "turboquant":
+        for e, c in enumerate(prompt_cache):
+            if hasattr(c, "to_turboquant") and c.offset >= quantized_kv_start:
+                prompt_cache[e] = c.to_turboquant(bits=kv_bits or 3)
+        return
     if kv_bits is None:
         return
     for e, c in enumerate(prompt_cache):
@@ -313,6 +325,7 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    kv_cache_type: str = "standard",
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
@@ -368,6 +381,8 @@ def generate_step(
         prompt_cache = cache.make_prompt_cache(
             model,
             max_kv_size=max_kv_size,
+            kv_cache_type=kv_cache_type,
+            kv_bits=kv_bits,
         )
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
@@ -377,6 +392,7 @@ def generate_step(
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
+        kv_cache_type=kv_cache_type,
     )
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
@@ -480,6 +496,7 @@ def speculative_generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    kv_cache_type: str = "standard",
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -529,6 +546,7 @@ def speculative_generate_step(
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
+        kv_cache_type=kv_cache_type,
     )
 
     def _process_and_sample(tokens, logits):
@@ -1526,6 +1544,7 @@ def main():
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,
         quantized_kv_start=args.quantized_kv_start,
+        kv_cache_type=getattr(args, "kv_cache_type", "standard"),
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
     )
