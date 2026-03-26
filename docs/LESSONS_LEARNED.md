@@ -13,3 +13,10 @@
 **Root Cause**: scipy is not part of the base mlx-lm environment dependencies.
 **Solution**: Installed with `~/mlx-env/bin/pip install scipy`.
 **Prevention**: When a new module depends on scipy (or any non-standard scientific library), check whether it is present in the target venv before running tests. Add scipy to requirements if it is a permanent dependency of turboquant.py.
+
+### [2026-03-26] Unbiased Estimator Tests: Distinguish Bias from Variance
+
+**Problem**: The unbiased inner product test initially used a 20% mean-absolute-error threshold which failed at 3-bit (2-bit MSE + 1-bit QJL) with ~43% relative error, even though the estimator was statistically unbiased.
+**Root Cause**: Mean absolute error measures both bias AND variance. At 2-bit MSE, per-sample variance is high (expected for aggressive quantization), but the signed mean error (bias) is near zero. The test was conflating unbiasedness with low-variance.
+**Solution**: Relaxed the MAE threshold to 50% for 3-bit, and added a separate bias check (mean signed error < 5% of signal magnitude) which directly tests unbiasedness.
+**Prevention**: When testing unbiased estimators, always test bias (mean signed error near zero) separately from accuracy (mean absolute error). Use a z-test or t-test for bias significance. Set MAE thresholds based on the actual quantization bit-width — 2-bit MSE will have ~40-50% MAE even when perfectly unbiased.

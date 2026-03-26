@@ -8,6 +8,7 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 from .base import create_causal_mask
+from .turboquant import TurboQuantConfig, turboquant_encode, turboquant_decode_values
 
 
 def make_prompt_cache(
@@ -320,6 +321,166 @@ class QuantizedKVCache(_BaseCache):
         return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
 
 
+class TurboQuantKVCache(_BaseCache):
+    """KV cache with TurboQuant compression (random rotation + Lloyd-Max + QJL)."""
+    step = 256
+
+    def __init__(self, bits: int = 3, seed: int = 42):
+        self.bits = bits
+        self.seed = seed
+        self.offset = 0
+        self._initialized = False
+        self._config = None
+        self._B = 0
+        self._n_kv_heads = 0
+        self._head_dim = 0
+
+        self._keys_idx = None
+        self._keys_qjl = None
+        self._keys_rnorm = None
+        self._keys_vnorm = None
+        self._values_idx = None
+        self._values_vnorm = None
+
+    def _lazy_init(self, head_dim):
+        self._config = TurboQuantConfig(head_dim=head_dim, bits=self.bits, seed=self.seed)
+        self._head_dim = head_dim
+        self._initialized = True
+
+    @property
+    def shape(self):
+        return (self._B, self._n_kv_heads, self.offset, self._head_dim)
+
+    def update_and_fetch(self, keys, values):
+        B, n_kv_heads, num_steps, head_dim = keys.shape
+        self._B = B
+        self._n_kv_heads = n_kv_heads
+
+        if not self._initialized:
+            self._lazy_init(head_dim)
+
+        prev = self.offset
+
+        enc_k = turboquant_encode(keys, self._config, mode="key")
+        enc_v = turboquant_encode(values, self._config, mode="value")
+
+        if self._keys_idx is None or (prev + num_steps) > self._keys_idx.shape[2]:
+            n_alloc = ((self.step + num_steps - 1) // self.step) * self.step
+
+            new_bufs = {
+                "_keys_idx": (B, n_kv_heads, n_alloc, enc_k["idx"].shape[-1], mx.uint32),
+                "_keys_qjl": (B, n_kv_heads, n_alloc, enc_k["qjl"].shape[-1], mx.uint32),
+                "_keys_rnorm": (B, n_kv_heads, n_alloc, 1, mx.float16),
+                "_keys_vnorm": (B, n_kv_heads, n_alloc, 1, mx.float16),
+                "_values_idx": (B, n_kv_heads, n_alloc, enc_v["idx"].shape[-1], mx.uint32),
+                "_values_vnorm": (B, n_kv_heads, n_alloc, 1, mx.float16),
+            }
+
+            for attr, (*shape, dt) in new_bufs.items():
+                old = getattr(self, attr)
+                new_buf = mx.zeros(shape, dtype=dt)
+                if old is not None:
+                    if prev % self.step != 0:
+                        old = old[:, :, :prev, :]
+                    setattr(self, attr, mx.concatenate([old, new_buf], axis=2))
+                else:
+                    setattr(self, attr, new_buf)
+
+        self.offset += num_steps
+        self._keys_idx[:, :, prev:self.offset, :] = enc_k["idx"]
+        self._keys_qjl[:, :, prev:self.offset, :] = enc_k["qjl"]
+        self._keys_rnorm[:, :, prev:self.offset, :] = enc_k["rnorm"]
+        self._keys_vnorm[:, :, prev:self.offset, :] = enc_k["vnorm"]
+        self._values_idx[:, :, prev:self.offset, :] = enc_v["idx"]
+        self._values_vnorm[:, :, prev:self.offset, :] = enc_v["vnorm"]
+
+        return self, self
+
+    def get_compressed_keys(self):
+        return {
+            "idx": self._keys_idx[:, :, :self.offset, :],
+            "qjl": self._keys_qjl[:, :, :self.offset, :],
+            "rnorm": self._keys_rnorm[:, :, :self.offset, :],
+            "vnorm": self._keys_vnorm[:, :, :self.offset, :],
+        }
+
+    def get_compressed_values(self):
+        return {
+            "idx": self._values_idx[:, :, :self.offset, :],
+            "vnorm": self._values_vnorm[:, :, :self.offset, :],
+        }
+
+    def size(self):
+        return self.offset
+
+    @property
+    def state(self):
+        if self._keys_idx is None:
+            return []
+        return (
+            self._keys_idx[:, :, :self.offset, :],
+            self._keys_qjl[:, :, :self.offset, :],
+            self._keys_rnorm[:, :, :self.offset, :],
+            self._keys_vnorm[:, :, :self.offset, :],
+            self._values_idx[:, :, :self.offset, :],
+            self._values_vnorm[:, :, :self.offset, :],
+        )
+
+    @state.setter
+    def state(self, v):
+        if not v:
+            return
+        (self._keys_idx, self._keys_qjl, self._keys_rnorm,
+         self._keys_vnorm, self._values_idx, self._values_vnorm) = v
+        self.offset = self._keys_idx.shape[2]
+
+    @property
+    def meta_state(self):
+        return tuple(map(str, (self.offset, self.bits, self.seed, self._head_dim)))
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.offset, self.bits, self.seed, hd = map(int, v)
+        if hd > 0:
+            self._lazy_init(hd)
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        offset, bits, seed, head_dim = map(int, meta_state)
+        obj = cls(bits=bits, seed=seed)
+        if head_dim > 0:
+            obj._lazy_init(head_dim)
+        obj.state = state
+        obj.offset = offset
+        return obj
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    def empty(self):
+        return self._keys_idx is None
+
+    @property
+    def nbytes(self):
+        if self._keys_idx is None:
+            return 0
+        total = 0
+        for attr in ["_keys_idx", "_keys_qjl", "_keys_rnorm", "_keys_vnorm",
+                      "_values_idx", "_values_vnorm"]:
+            arr = getattr(self, attr)
+            if arr is not None:
+                total += arr.nbytes
+        return total
+
+
 class KVCache(_BaseCache):
     step = 256
 
@@ -387,6 +548,15 @@ class KVCache(_BaseCache):
                 self.values, group_size=group_size, bits=bits
             )
         return quant_cache
+
+    def to_turboquant(self, bits: int = 3, seed: int = 42):
+        from .turboquant import TurboQuantConfig, turboquant_encode
+        tq_cache = TurboQuantKVCache(bits=bits, seed=seed)
+        if self.keys is not None:
+            keys = self.keys[..., :self.offset, :]
+            values = self.values[..., :self.offset, :]
+            tq_cache.update_and_fetch(keys, values)
+        return tq_cache
 
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
