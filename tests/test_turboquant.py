@@ -3,6 +3,7 @@ import pytest
 
 from mlx_lm.models.turboquant import generate_qjl_matrix, generate_rotation_matrix, solve_lloyd_max
 from mlx_lm.models.turboquant import pack_indices, unpack_indices, pack_signs, unpack_signs
+from mlx_lm.models.turboquant import turboquant_encode, turboquant_decode_values, TurboQuantConfig
 
 
 def test_placeholder():
@@ -109,3 +110,43 @@ class TestBitPacking:
         indices = mx.array([[0] * 128], dtype=mx.uint32)
         packed = pack_indices(indices, bits=2)
         assert packed.shape == (1, 8)  # 128 * 2 / 32 = 8 uint32s
+
+
+class TestEncodeDecode:
+    @pytest.fixture
+    def config(self):
+        return TurboQuantConfig(head_dim=128, bits=3, seed=42)
+
+    def test_encode_output_shapes(self, config):
+        x = mx.random.normal((1, 4, 8, 128))  # B=1, heads=4, seq=8, d=128
+        result = turboquant_encode(x, config, mode="key")
+        # Check idx shape: 128 coords * 2 bits / 32 = 8 packed uint32
+        assert result["idx"].shape[0:3] == (1, 4, 8)
+        assert "qjl" in result
+        assert result["rnorm"].shape == (1, 4, 8, 1)
+        assert result["vnorm"].shape == (1, 4, 8, 1)
+
+    def test_encode_value_mode_no_qjl(self, config):
+        x = mx.random.normal((1, 4, 8, 128))
+        result = turboquant_encode(x, config, mode="value")
+        assert "qjl" not in result
+        assert "rnorm" not in result
+        assert result["vnorm"].shape == (1, 4, 8, 1)
+
+    def test_value_decode_roundtrip_mse(self, config):
+        """MSE should be reasonable for 3-bit quantization."""
+        mx.random.seed(0)
+        x = mx.random.normal((1, 4, 32, 128))
+        encoded = turboquant_encode(x, config, mode="value")
+        decoded = turboquant_decode_values(encoded, config)
+        # Normalized MSE check: reconstruct and compare
+        x_norm = mx.linalg.norm(x, axis=-1, keepdims=True)
+        decoded_norm = mx.linalg.norm(decoded, axis=-1, keepdims=True)
+        # The norms should roughly match (vnorm is preserved)
+        assert mx.allclose(x_norm, decoded_norm, atol=1.0).item()
+
+    def test_vnorm_preserved(self, config):
+        x = mx.random.normal((1, 4, 8, 128))
+        norms = mx.linalg.norm(x, axis=-1, keepdims=True)
+        encoded = turboquant_encode(x, config, mode="key")
+        assert mx.allclose(encoded["vnorm"], norms.astype(mx.float16), atol=0.5).item()

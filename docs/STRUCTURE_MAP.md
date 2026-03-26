@@ -24,13 +24,13 @@ mlx-lm-fork/
 
 | Path                          | Purpose                                                         |
 | ----------------------------- | --------------------------------------------------------------- |
-| `mlx_lm/models/turboquant.py` | Lloyd-Max codebook solver; future home of TurboQuantKVCache     |
+| `mlx_lm/models/turboquant.py` | Lloyd-Max solver, bit packing, encode/decode fallback (Task 5)  |
 | `mlx_lm/models/base.py`       | Base model; will need SDPA dispatch hooks for TurboQuant        |
 | `mlx_lm/models/cache.py`      | Existing KV cache; TurboQuantKVCache will extend this interface |
 | `tests/test_turboquant.py`    | TDD tests for TurboQuant components                             |
 
 ## Recently added/changed
 
-- `mlx_lm/models/turboquant.py` — created (Task 2: Lloyd-Max solver)
-- `tests/test_turboquant.py` — added `TestLloydMax` class (Task 2)
+- `mlx_lm/models/turboquant.py` — created (Task 2: Lloyd-Max solver); bit packing (Task 4); encode/decode fallback (Task 5)
+- `tests/test_turboquant.py` — `TestLloydMax` (Task 2); `TestBitPacking` (Task 4); `TestEncodeDecode` (Task 5)
 - `docs/` — directory created; `STRUCTURE_MAP.md` and `LESSONS_LEARNED.md` added

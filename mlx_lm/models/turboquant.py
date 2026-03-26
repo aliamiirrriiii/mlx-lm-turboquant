@@ -5,6 +5,7 @@ Reference: "TurboQuant: Online Vector Quantization with Near-optimal Distortion 
 """
 
 import math
+from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 import mlx.core as mx
@@ -156,3 +157,134 @@ def unpack_signs(packed: mx.array, dim: int) -> mx.array:
         sign = mx.where(bit, mx.array(1.0), mx.array(-1.0))
         result.append(sign)
     return mx.stack(result, axis=-1)
+
+
+# ---------------------------------------------------------------------------
+# TurboQuant Encode / Decode — Pure MLX fallback path
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TurboQuantConfig:
+    """Configuration for TurboQuant compression."""
+    head_dim: int
+    bits: int = 3
+    seed: int = 42
+
+    # Computed at init
+    mse_bits: int = field(init=False)
+    Pi_k: mx.array = field(init=False, repr=False)
+    Pi_v: mx.array = field(init=False, repr=False)
+    S: mx.array = field(init=False, repr=False)
+    centroids_k: mx.array = field(init=False, repr=False)
+    boundaries_k: mx.array = field(init=False, repr=False)
+    centroids_v: mx.array = field(init=False, repr=False)
+    boundaries_v: mx.array = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self.mse_bits = max(self.bits - 1, 1)
+        self.Pi_k = generate_rotation_matrix(self.head_dim, seed=self.seed)
+        self.Pi_v = generate_rotation_matrix(self.head_dim, seed=self.seed + 1)
+        self.S = generate_qjl_matrix(self.head_dim, m=self.head_dim, seed=self.seed + 2)
+        self.centroids_k, self.boundaries_k = solve_lloyd_max(self.head_dim, self.mse_bits)
+        self.centroids_v, self.boundaries_v = solve_lloyd_max(self.head_dim, self.bits)
+
+
+def turboquant_encode(
+    x: mx.array,
+    config: TurboQuantConfig,
+    mode: str = "key",
+) -> dict:
+    """
+    Encode vectors using TurboQuant.
+
+    Args:
+        x: input tensor (B, n_heads, seq_len, head_dim)
+        config: TurboQuantConfig
+        mode: "key" (MSE + QJL) or "value" (MSE only, full bits)
+
+    Returns:
+        dict with packed idx, qjl (keys only), rnorm (keys only), vnorm
+    """
+    B, n_heads, seq_len, d = x.shape
+
+    # Normalize to unit sphere
+    vnorm = mx.linalg.norm(x, axis=-1, keepdims=True).astype(mx.float16)
+    x_unit = x / (vnorm.astype(x.dtype) + 1e-8)
+
+    if mode == "key":
+        Pi = config.Pi_k
+        centroids = config.centroids_k
+        mse_bits = config.mse_bits
+    else:
+        Pi = config.Pi_v
+        centroids = config.centroids_v
+        mse_bits = config.bits
+
+    # Stage 1: Rotate and quantize
+    y = x_unit @ Pi.astype(x.dtype).T
+
+    # Find nearest centroid per coordinate
+    c = centroids.astype(x.dtype)
+    diffs = mx.abs(mx.expand_dims(y, -1) - c)  # (B, H, S, d, n_levels)
+    indices = mx.argmin(diffs, axis=-1).astype(mx.uint32)  # (B, H, S, d)
+    y_hat = c[indices]  # (B, H, S, d)
+
+    # Pack indices
+    packed_idx = pack_indices(indices.reshape(-1, d), bits=mse_bits)
+    packed_idx = packed_idx.reshape(B, n_heads, seq_len, -1)
+
+    result = {"idx": packed_idx, "vnorm": vnorm}
+
+    if mode == "key":
+        # Stage 2: QJL on residual
+        x_hat = y_hat @ Pi.astype(x.dtype)  # inverse rotation
+        residual = x_unit - x_hat
+        rnorm = mx.linalg.norm(residual, axis=-1, keepdims=True).astype(mx.float16)
+
+        S = config.S.astype(x.dtype)
+        projected = residual @ S.T  # (B, H, S, m)
+        signs = mx.sign(projected)
+        signs = mx.where(signs == 0, mx.array(1.0, dtype=signs.dtype), signs)
+
+        packed_qjl = pack_signs(signs.reshape(-1, d))
+        packed_qjl = packed_qjl.reshape(B, n_heads, seq_len, -1)
+
+        result["qjl"] = packed_qjl
+        result["rnorm"] = rnorm
+
+    return result
+
+
+def turboquant_decode_values(
+    encoded: dict,
+    config: TurboQuantConfig,
+) -> mx.array:
+    """
+    Decode value vectors from compressed representation.
+
+    Args:
+        encoded: dict from turboquant_encode with mode="value"
+        config: TurboQuantConfig
+
+    Returns:
+        Reconstructed values (B, n_heads, seq_len, head_dim)
+    """
+    packed_idx = encoded["idx"]
+    vnorm = encoded["vnorm"]
+    B, n_heads, seq_len, _ = packed_idx.shape
+    d = config.head_dim
+
+    # Unpack indices
+    flat_packed = packed_idx.reshape(-1, packed_idx.shape[-1])
+    indices = unpack_indices(flat_packed, bits=config.bits, dim=d)
+    indices = indices.reshape(B, n_heads, seq_len, d)
+
+    # Lookup centroids and inverse rotate
+    c = config.centroids_v
+    y_hat = c[indices].astype(mx.float16)
+    Pi_v = config.Pi_v.astype(mx.float16)
+    x_hat = y_hat @ Pi_v  # inverse rotation: y = x @ Pi.T, so x = y @ Pi
+
+    # Rescale by original norm
+    return x_hat * vnorm.astype(mx.float16)
