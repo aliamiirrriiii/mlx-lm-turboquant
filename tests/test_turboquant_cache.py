@@ -1,6 +1,7 @@
 import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import TurboQuantKVCache, KVCache
+from mlx_lm.models.base import scaled_dot_product_attention
 
 
 class TestTurboQuantKVCache:
@@ -118,3 +119,63 @@ class TestTurboQuantKVCache:
         tq.update_and_fetch(keys, values)
 
         assert tq.nbytes < std.nbytes
+
+
+class TestTurboQuantSDPA:
+    def test_attention_output_shape(self):
+        cache = TurboQuantKVCache(bits=3, seed=42)
+        keys = mx.random.normal((1, 4, 16, 128))
+        values = mx.random.normal((1, 4, 16, 128))
+        cache.update_and_fetch(keys, values)
+
+        queries = mx.random.normal((1, 4, 1, 128))
+        output = scaled_dot_product_attention(
+            queries, cache, cache, cache=cache, scale=128**-0.5, mask=None
+        )
+        assert output.shape == (1, 4, 1, 128)
+
+    def test_attention_no_nan(self):
+        """Output should not contain NaN."""
+        cache = TurboQuantKVCache(bits=3, seed=42)
+        keys = mx.random.normal((1, 4, 32, 128))
+        values = mx.random.normal((1, 4, 32, 128))
+        cache.update_and_fetch(keys, values)
+
+        queries = mx.random.normal((1, 4, 1, 128))
+        output = scaled_dot_product_attention(
+            queries, cache, cache, cache=cache, scale=128**-0.5, mask=None
+        )
+        assert not mx.any(mx.isnan(output)).item()
+
+    def test_attention_cosine_similarity(self):
+        """TurboQuant attention should be somewhat close to uncompressed attention."""
+        mx.random.seed(0)
+        keys = mx.random.normal((1, 4, 32, 128))
+        values = mx.random.normal((1, 4, 32, 128))
+        queries = mx.random.normal((1, 4, 1, 128))
+        scale = 128**-0.5
+
+        ref = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=scale, mask=None
+        )
+
+        cache = TurboQuantKVCache(bits=3, seed=42)
+        cache.update_and_fetch(keys, values)
+        tq = scaled_dot_product_attention(
+            queries, cache, cache, cache=cache, scale=scale, mask=None
+        )
+
+        cos_sim = mx.sum(ref * tq) / (mx.linalg.norm(ref) * mx.linalg.norm(tq) + 1e-8)
+        assert cos_sim.item() > 0.85  # > 85% similarity at 3-bit
+
+    def test_sinks_raises_error(self):
+        cache = TurboQuantKVCache(bits=3, seed=42)
+        keys = mx.random.normal((1, 4, 8, 128))
+        values = mx.random.normal((1, 4, 8, 128))
+        cache.update_and_fetch(keys, values)
+        queries = mx.random.normal((1, 4, 1, 128))
+        with pytest.raises(ValueError, match="TurboQuant"):
+            scaled_dot_product_attention(
+                queries, cache, cache, cache=cache, scale=0.1,
+                mask=None, sinks=mx.array([0])
+            )

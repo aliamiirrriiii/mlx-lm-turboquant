@@ -105,6 +105,64 @@ def quantized_scaled_dot_product_attention(
     return out
 
 
+def turboquant_scaled_dot_product_attention(
+    queries: mx.array,
+    cache: "TurboQuantKVCache",
+    scale: float,
+    mask: Optional[mx.array],
+) -> mx.array:
+    """Compute attention using TurboQuant-compressed KV cache."""
+    from .turboquant import turboquant_inner_product, turboquant_decode_values
+
+    config = cache._config
+    compressed_keys = cache.get_compressed_keys()
+    compressed_values = cache.get_compressed_values()
+
+    B, n_q_heads, L, D = queries.shape
+    n_kv_heads = cache._n_kv_heads
+    n_repeats = n_q_heads // n_kv_heads
+
+    if n_repeats > 1:
+        queries_grouped = mx.reshape(queries, (B, n_kv_heads, n_repeats, L, D))
+        q_for_ip = queries_grouped.reshape(B, n_kv_heads, n_repeats * L, D)
+    else:
+        q_for_ip = queries
+
+    # Compute attention scores in compressed space
+    scores = turboquant_inner_product(q_for_ip, compressed_keys, config)
+    scores = scores * scale
+
+    if n_repeats > 1:
+        scores = scores.reshape(B, n_kv_heads, n_repeats, L, -1)
+
+    # Apply mask
+    if mask is not None:
+        if isinstance(mask, str):
+            qL, kL = scores.shape[-2:]
+            q_indices = mx.arange(kL - qL, kL)
+            k_indices = mx.arange(kL)
+            mask = q_indices[:, None] >= k_indices[None]
+        if mask.dtype == mx.bool_:
+            scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
+        else:
+            scores += mask
+
+    weights = mx.softmax(scores, axis=-1, precise=True)
+
+    # Decode values
+    values = turboquant_decode_values(compressed_values, config)
+
+    if n_repeats > 1:
+        values = mx.expand_dims(values, axis=-3)
+
+    out = weights @ values
+
+    if n_repeats > 1:
+        out = mx.reshape(out, (B, n_q_heads, L, -1))
+
+    return out
+
+
 def scaled_dot_product_attention(
     queries,
     keys,
@@ -114,7 +172,15 @@ def scaled_dot_product_attention(
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
-    if hasattr(cache, "bits"):
+    from .cache import TurboQuantKVCache
+
+    if isinstance(cache, TurboQuantKVCache):
+        if sinks is not None:
+            raise ValueError("TurboQuant SDPA does not support attention sinks.")
+        return turboquant_scaled_dot_product_attention(
+            queries, cache, scale=scale, mask=mask
+        )
+    elif hasattr(cache, "bits"):
         if sinks is not None:
             raise ValueError("Quantized SDPA does not support attention sinks.")
         return quantized_scaled_dot_product_attention(
