@@ -104,26 +104,16 @@ def pack_indices(indices: mx.array, bits: int) -> mx.array:
         shifts = mx.arange(0, 32, bits, dtype=mx.uint32)  # [0, bits, 2*bits, ...]
         return mx.sum(reshaped << shifts, axis=-1)
 
-    # General path for 3-bit etc: precompute word/offset tables, vectorized scatter
-    n_ints = (d * bits + 31) // 32
-    positions = mx.arange(d, dtype=mx.uint32)
-    bit_pos = positions * bits
-    word_idx = bit_pos // 32
-    bit_offset = bit_pos % 32
-
-    packed = mx.zeros((*batch_dims, n_ints), dtype=mx.uint32)
-    for w in range(n_ints):
-        in_word = word_idx == w
-        shifted = mx.where(in_word, indices_u32 << bit_offset, mx.zeros_like(indices_u32))
-        packed[..., w] = mx.sum(shifted, axis=-1)
-        # Handle overflow from previous word into this one
-        if w > 0:
-            overflows = (word_idx == (w - 1)) & ((bit_offset + bits) > 32)
-            if mx.any(overflows).item():
-                overflow_shift = bits - (bit_offset + bits - 32)
-                overflow_vals = mx.where(overflows, indices_u32 >> overflow_shift, mx.zeros_like(indices_u32))
-                packed[..., w] = packed[..., w] + mx.sum(overflow_vals, axis=-1)
-    return packed
+    # General path for 3-bit etc: pad to next multiple of vals_per_word to avoid overflow
+    # Strategy: store vals_per_word values per uint32, waste a few bits
+    # For 3-bit: 10 values per word (30 bits used, 2 wasted)
+    n_ints = (d + vals_per_word - 1) // vals_per_word
+    pad = n_ints * vals_per_word - d
+    if pad > 0:
+        indices_u32 = mx.pad(indices_u32, [(0, 0)] * len(batch_dims) + [(0, pad)])
+    reshaped = indices_u32.reshape(*batch_dims, n_ints, vals_per_word)
+    shifts = mx.arange(0, vals_per_word * bits, bits, dtype=mx.uint32)
+    return mx.sum(reshaped << shifts, axis=-1)
 
 
 def unpack_indices(packed: mx.array, bits: int, dim: int) -> mx.array:
@@ -139,22 +129,14 @@ def unpack_indices(packed: mx.array, bits: int, dim: int) -> mx.array:
         expanded = expanded & mx.array(mask_val, dtype=mx.uint32)
         return expanded.reshape(*packed.shape[:-1], dim)
 
-    # General path for 3-bit etc
-    positions = mx.arange(dim, dtype=mx.uint32)
-    bit_pos = positions * bits
-    word_idx = (bit_pos // 32).tolist()
-    bit_offset = (bit_pos % 32).tolist()
+    # General path for 3-bit etc: vals_per_word values per uint32 (matches pack)
+    vals_per_word = 32 // bits
+    shifts = mx.arange(0, vals_per_word * bits, bits, dtype=mx.uint32)
     mask = mx.array(mask_val, dtype=mx.uint32)
-
-    parts = []
-    for i in range(dim):
-        w, off = word_idx[i], bit_offset[i]
-        val = packed[..., w] >> off
-        overflow = off + bits - 32
-        if overflow > 0:
-            val = val | (packed[..., w + 1] << (bits - overflow))
-        parts.append(val & mask)
-    return mx.stack(parts, axis=-1)
+    expanded = (mx.expand_dims(packed, -1) >> shifts) & mask
+    n_total = packed.shape[-1] * vals_per_word
+    expanded = expanded.reshape(*packed.shape[:-1], n_total)
+    return expanded[..., :dim]
 
 
 def pack_signs(signs: mx.array) -> mx.array:
@@ -549,17 +531,15 @@ def _make_attention_scores_kernel():
         const device uint32_t* k_qjl_ptr = keys_qjl + k_idx * QJL_STRIDE;
 
         // Term 1: dot(q_rot, codebook[idx]) — iterate over coordinates
+        // Packing: vals_per_word values per uint32, no cross-word overflow
+        constexpr uint VPW = 32 / BITS;
         float term1 = 0.0f;
         for (uint i = 0; i < D; i++) {
-            uint bit_pos = i * BITS;
-            uint word = bit_pos / 32;
-            uint offset = bit_pos % 32;
+            uint w = i / VPW;
+            uint pos_in_word = i % VPW;
+            uint offset = pos_in_word * BITS;
             uint mask = (1u << BITS) - 1u;
-            uint c_idx = (k_idx_ptr[word] >> offset) & mask;
-            if (offset + BITS > 32) {
-                uint overflow = offset + BITS - 32;
-                c_idx |= (k_idx_ptr[word + 1] << (BITS - overflow)) & mask;
-            }
+            uint c_idx = (k_idx_ptr[w] >> offset) & mask;
             term1 += static_cast<float>(q_rot_ptr[i]) * centroids[c_idx];
         }
 
@@ -627,21 +607,17 @@ def _make_dequantize_values_kernel():
         // But we only have y_hat[coord], not the full vector.
         // Each thread computes one ROTATED coordinate; we need cooperative inverse rotation.
 
-        // Alternative: each grid position is (vec_id, output_coord).
+        // Each grid position is (vec_id, output_coord).
         // output[coord] = vnorm * sum_j Pi_v[j, coord] * centroids[idx[j]]
+        // Packing: vals_per_word values per uint32, no cross-word overflow
+        constexpr uint VPW = 32 / BITS;  // vals per word
         float val = 0.0f;
         for (uint j = 0; j < D; j++) {
-            // Unpack index for coordinate j
-            uint bp = j * BITS;
-            uint w = bp / 32;
-            uint off = bp % 32;
+            uint w = j / VPW;
+            uint pos_in_word = j % VPW;
+            uint off = pos_in_word * BITS;
             uint m = (1u << BITS) - 1u;
             uint cj = (idx_ptr[w] >> off) & m;
-            if (off + BITS > 32) {
-                uint ov = off + BITS - 32;
-                cj |= (idx_ptr[w + 1] << (BITS - ov)) & m;
-            }
-            // Pi_v[j, coord] = Pi_v[j * D + coord]
             val += static_cast<float>(Pi_v[j * D + coord]) * centroids[cj];
         }
 
@@ -798,7 +774,5 @@ def decode_values(encoded: dict, config: TurboQuantConfig) -> mx.array:
 def inner_product(
     queries: mx.array, compressed: dict, config: TurboQuantConfig
 ) -> mx.array:
-    """Compute inner products with auto Metal dispatch."""
-    if _attn_scores_kernel is not None:
-        return turboquant_inner_product_metal(queries, compressed, config)
+    """Compute inner products. Uses vectorized pure MLX (faster than Metal per-head loop)."""
     return turboquant_inner_product(queries, compressed, config)
