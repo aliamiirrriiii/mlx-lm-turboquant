@@ -14,6 +14,8 @@ from .turboquant import TurboQuantConfig, turboquant_encode, turboquant_decode_v
 def make_prompt_cache(
     model: nn.Module,
     max_kv_size: Optional[int] = None,
+    kv_cache_type: str = "standard",
+    kv_bits: Optional[int] = None,
 ) -> List[Any]:
     """
     Construct the model's cache for use in generation.
@@ -26,12 +28,27 @@ def make_prompt_cache(
         max_kv_size (Optional[int]): If provided and the model does not have a
             ``make_cache`` method, a ``RotatingKVCache`` is used with a maximum
             size of ``max_kv_size``
+        kv_cache_type (str): The type of KV cache to use. Options are
+            ``"standard"``, ``"quantized"``, or ``"turboquant"``.
+            Default: ``"standard"``.
+        kv_bits (Optional[int]): Number of bits for turboquant KV cache.
+            Only used when ``kv_cache_type="turboquant"``. Default: ``None``
+            (uses 3 bits).
     """
     if hasattr(model, "make_cache"):
         return model.make_cache()
 
     num_layers = len(model.layers)
-    if max_kv_size is not None:
+
+    if kv_cache_type == "turboquant":
+        if max_kv_size is not None:
+            raise ValueError(
+                "--max-kv-size and --kv-cache-type turboquant are mutually exclusive in v1. "
+                "RotatingKVCache + TurboQuant is not yet supported."
+            )
+        bits = kv_bits if kv_bits is not None else 3
+        return [TurboQuantKVCache(bits=bits) for _ in range(num_layers)]
+    elif max_kv_size is not None:
         return [
             RotatingKVCache(max_size=max_kv_size, keep=4) for _ in range(num_layers)
         ]

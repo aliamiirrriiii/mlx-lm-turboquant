@@ -1,6 +1,6 @@
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import TurboQuantKVCache, KVCache
+from mlx_lm.models.cache import make_prompt_cache, TurboQuantKVCache, KVCache
 from mlx_lm.models.base import scaled_dot_product_attention
 
 
@@ -179,3 +179,29 @@ class TestTurboQuantSDPA:
                 queries, cache, cache, cache=cache, scale=0.1,
                 mask=None, sinks=mx.array([0])
             )
+
+
+class TestCLIIntegration:
+    def test_make_prompt_cache_turboquant(self):
+        class MockModel:
+            layers = [None] * 4
+        model = MockModel()
+        caches = make_prompt_cache(model, kv_cache_type="turboquant", kv_bits=3)
+        assert len(caches) == 4
+        assert all(isinstance(c, TurboQuantKVCache) for c in caches)
+        assert caches[0].bits == 3
+
+    def test_make_prompt_cache_default_unchanged(self):
+        class MockModel:
+            layers = [None] * 4
+        model = MockModel()
+        caches = make_prompt_cache(model)
+        assert len(caches) == 4
+        assert all(isinstance(c, KVCache) for c in caches)
+
+    def test_turboquant_and_max_kv_size_raises(self):
+        class MockModel:
+            layers = [None] * 4
+        model = MockModel()
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            make_prompt_cache(model, max_kv_size=1024, kv_cache_type="turboquant")
