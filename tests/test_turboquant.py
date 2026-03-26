@@ -2,6 +2,7 @@ import mlx.core as mx
 import pytest
 
 from mlx_lm.models.turboquant import generate_qjl_matrix, generate_rotation_matrix, solve_lloyd_max
+from mlx_lm.models.turboquant import pack_indices, unpack_indices, pack_signs, unpack_signs
 
 
 def test_placeholder():
@@ -78,3 +79,33 @@ class TestMatrixGeneration:
         S1 = generate_qjl_matrix(d=128, m=128, seed=42)
         S2 = generate_qjl_matrix(d=128, m=128, seed=42)
         assert mx.allclose(S1, S2).item()
+
+
+class TestBitPacking:
+    def test_pack_unpack_2bit_roundtrip(self):
+        indices = mx.array([[0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]], dtype=mx.uint32)
+        packed = pack_indices(indices, bits=2)
+        unpacked = unpack_indices(packed, bits=2, dim=16)
+        assert mx.array_equal(indices, unpacked).item()
+
+    def test_pack_unpack_3bit_roundtrip(self):
+        indices = mx.array([[i % 8 for i in range(32)]], dtype=mx.uint32)
+        packed = pack_indices(indices, bits=3)
+        unpacked = unpack_indices(packed, bits=3, dim=32)
+        assert mx.array_equal(indices, unpacked).item()
+
+    def test_pack_signs_roundtrip(self):
+        signs = mx.array([[1, -1, 1, 1, -1, -1, 1, -1] * 4], dtype=mx.float32)
+        packed = pack_signs(signs)
+        unpacked = unpack_signs(packed, dim=32)
+        assert mx.array_equal(signs, unpacked).item()
+
+    def test_pack_signs_shape(self):
+        signs = mx.array([[1, -1] * 64], dtype=mx.float32)  # 128 signs
+        packed = pack_signs(signs)
+        assert packed.shape == (1, 4)  # 128 / 32 = 4 uint32s
+
+    def test_pack_2bit_shape(self):
+        indices = mx.array([[0] * 128], dtype=mx.uint32)
+        packed = pack_indices(indices, bits=2)
+        assert packed.shape == (1, 8)  # 128 * 2 / 32 = 8 uint32s

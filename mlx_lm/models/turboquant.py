@@ -88,3 +88,71 @@ def generate_qjl_matrix(d: int, m: Optional[int] = None, seed: int = 42) -> mx.a
     rng = np.random.RandomState(seed)
     S = rng.randn(m, d).astype(np.float32)
     return mx.array(S, dtype=mx.float16)
+
+
+def pack_indices(indices: mx.array, bits: int) -> mx.array:
+    """Pack integer indices into uint32 arrays. indices shape: (..., d), values in [0, 2^bits).
+
+    Handles cross-word boundary spanning when bit_offset + bits > 32.
+    """
+    *batch_dims, d = indices.shape
+    n_ints = (d * bits + 31) // 32
+
+    packed = mx.zeros((*batch_dims, n_ints), dtype=mx.uint32)
+    for i in range(d):
+        bit_pos = i * bits
+        int_idx = bit_pos // 32
+        bit_offset = bit_pos % 32
+        val = indices[..., i].astype(mx.uint32)
+        # Write bits that fit in the current word
+        packed[..., int_idx] = packed[..., int_idx] | (val << bit_offset)
+        # Handle overflow into the next word
+        overflow = bit_offset + bits - 32
+        if overflow > 0 and int_idx + 1 < n_ints:
+            packed[..., int_idx + 1] = packed[..., int_idx + 1] | (val >> (bits - overflow))
+    return packed
+
+
+def unpack_indices(packed: mx.array, bits: int, dim: int) -> mx.array:
+    """Unpack uint32 arrays back to integer indices. Returns shape (..., dim).
+
+    Handles cross-word boundary spanning when bit_offset + bits > 32.
+    """
+    mask = mx.array((1 << bits) - 1, dtype=mx.uint32)
+    result = []
+    for i in range(dim):
+        bit_pos = i * bits
+        int_idx = bit_pos // 32
+        bit_offset = bit_pos % 32
+        val = packed[..., int_idx] >> bit_offset
+        # Handle overflow from the next word
+        overflow = bit_offset + bits - 32
+        if overflow > 0:
+            val = val | (packed[..., int_idx + 1] << (bits - overflow))
+        result.append(val & mask)
+    return mx.stack(result, axis=-1)
+
+
+def pack_signs(signs: mx.array) -> mx.array:
+    """Pack sign values (+1/-1) into uint32 bit arrays. signs shape: (..., d)."""
+    *batch_dims, d = signs.shape
+    n_ints = (d + 31) // 32
+    bits = (signs > 0).astype(mx.uint32)
+    packed = mx.zeros((*batch_dims, n_ints), dtype=mx.uint32)
+    for i in range(d):
+        int_idx = i // 32
+        bit_offset = i % 32
+        packed[..., int_idx] = packed[..., int_idx] | (bits[..., i] << bit_offset)
+    return packed
+
+
+def unpack_signs(packed: mx.array, dim: int) -> mx.array:
+    """Unpack uint32 bit arrays back to sign values (+1/-1). Returns shape (..., dim)."""
+    result = []
+    for i in range(dim):
+        int_idx = i // 32
+        bit_offset = i % 32
+        bit = (packed[..., int_idx] >> bit_offset) & mx.array(1, dtype=mx.uint32)
+        sign = mx.where(bit, mx.array(1.0), mx.array(-1.0))
+        result.append(sign)
+    return mx.stack(result, axis=-1)
