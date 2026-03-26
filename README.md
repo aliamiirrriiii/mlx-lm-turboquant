@@ -4,25 +4,44 @@
 
 TurboQuant ([ICLR 2026](https://openreview.net/pdf?id=tO3ASKZlok)) compresses the key-value cache during LLM inference using a two-stage algorithm: random rotation + Lloyd-Max quantization, followed by 1-bit QJL residual correction for unbiased attention scores. This lets you run longer contexts and larger models on the same hardware.
 
-## Results
+## Benchmarks
 
-Tested on **Qwen3.5-35B-A3B-4bit** (Apple Silicon, MLX):
+Tested on Apple Silicon with MLX. All models 4-bit weight-quantized.
 
-| Metric                      | Value                                              |
-| --------------------------- | -------------------------------------------------- |
-| KV Cache Compression        | **10x** (standard fp16 vs TurboQuant 3-bit)        |
-| Attention Cosine Similarity | **92%** vs uncompressed                            |
-| Accuracy Loss               | Negligible (unbiased estimator)                    |
-| Model Files Changed         | **0** (works with all 80+ supported architectures) |
+### KV Cache Memory (lower is better)
 
-### Memory Comparison (Qwen3.5-35B-A3B, 8 KV heads, d=128, 64 layers)
+| Context | 9B Standard | 9B TurboQuant | Savings  | 27B Standard | 27B TurboQuant | Savings  |
+| ------- | ----------- | ------------- | -------- | ------------ | -------------- | -------- |
+| 256     | 33 MB       | 49 MB         | -        | 91 MB        | 148 MB         | -        |
+| 1024    | 57 MB       | 54 MB         | 1.1x     | 139 MB       | 158 MB         | 0.9x     |
+| 4096    | 153 MB      | 73 MB         | **2.1x** | 331 MB       | 196 MB         | **1.7x** |
 
-| Context Length | Standard (fp16) | mlx-lm Quantized (4-bit) | TurboQuant (3-bit) |
-| -------------- | --------------- | ------------------------ | ------------------ |
-| 8K tokens      | 2.1 GB          | 525 MB                   | **418 MB**         |
-| 32K tokens     | 8.4 GB          | 2.1 GB                   | **1.67 GB**        |
-| 64K tokens     | 16.8 GB         | 4.2 GB                   | **3.34 GB**        |
-| 128K tokens    | 33.6 GB         | 8.4 GB                   | **6.68 GB**        |
+TurboQuant has fixed overhead per layer (~96 KB for rotation/projection matrices). At short contexts (<512 tokens) the overhead exceeds the savings. At 4K+ tokens, compression dominates and memory drops significantly. At 32K+ tokens, expect 4-5x savings.
+
+### Generation Speed (higher is better)
+
+| Model            | Standard   | TurboQuant | Ratio |
+| ---------------- | ---------- | ---------- | ----- |
+| Qwen3.5-9B-4bit  | 45.6 tok/s | 19.6 tok/s | 0.43x |
+| Qwen3.5-27B-4bit | 14.0 tok/s | 9.0 tok/s  | 0.64x |
+
+Speed overhead comes from the encode step (rotation + quantization per new token) and value dequantization (inverse rotation per attention step). The larger the model, the smaller the relative overhead since model compute dominates. Metal kernels accelerate attention scores and value dequantization.
+
+### Quality
+
+| Metric                              | Value                                                      |
+| ----------------------------------- | ---------------------------------------------------------- |
+| Attention cosine similarity (3-bit) | **92%** vs uncompressed                                    |
+| Inner product estimator             | Unbiased (zero systematic drift)                           |
+| Output quality                      | Coherent, correct generation verified on all tested models |
+| Model files changed                 | **0** (works with all 80+ architectures)                   |
+
+### When to use TurboQuant
+
+- **Long contexts (4K+ tokens)**: Memory savings dominate the fixed overhead
+- **Memory-constrained**: When you need to fit a larger model or longer context on your Mac
+- **Batch inference**: Memory savings multiply with batch size
+- **Not ideal for**: Short conversations (<512 tokens) where the overhead exceeds savings
 
 ## Quick Start
 
