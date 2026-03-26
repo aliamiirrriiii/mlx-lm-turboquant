@@ -36,7 +36,15 @@ def make_prompt_cache(
             (uses 3 bits).
     """
     if hasattr(model, "make_cache"):
-        return model.make_cache()
+        caches = model.make_cache()
+        if kv_cache_type == "turboquant":
+            bits = kv_bits if kv_bits is not None else 3
+            # Replace only KVCache instances (leave ArraysCache etc. for SSM layers)
+            caches = [
+                TurboQuantKVCache(bits=bits) if isinstance(c, KVCache) else c
+                for c in caches
+            ]
+        return caches
 
     num_layers = len(model.layers)
 
