@@ -355,3 +355,421 @@ def turboquant_inner_product(
     vnorm_t = vnorm.astype(dtype).swapaxes(-2, -1)
 
     return vnorm_t * (term1 + term2)
+
+
+# ---------------------------------------------------------------------------
+# Metal Kernels
+# ---------------------------------------------------------------------------
+
+def _make_encode_kernel():
+    """Fused encode kernel: normalize -> rotate -> quantize -> pack -> (QJL for keys)."""
+    if not mx.metal.is_available():
+        return None
+
+    source = """
+        uint vec_id = thread_position_in_grid.x;
+        uint tid = thread_position_in_threadgroup.x;
+
+        if (vec_id >= N) return;
+
+        // Pointers for this vector
+        const device T* vec_in = input + vec_id * D;
+        device uint32_t* idx_out = out_idx + vec_id * IDX_STRIDE;
+        device T* vnorm_out = out_vnorm + vec_id;
+        device T* rnorm_out = out_rnorm + vec_id;
+
+        // Zero the packed outputs (all threads contribute via atomic OR)
+        for (uint i = tid; i < IDX_STRIDE; i += THREADS) {
+            idx_out[i] = 0;
+        }
+
+        device uint32_t* qjl_out = out_qjl + vec_id * QJL_STRIDE;
+        if (IS_KEY) {
+            for (uint i = tid; i < QJL_STRIDE; i += THREADS) {
+                qjl_out[i] = 0;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+
+        // Step 1: Compute vector norm
+        float norm_sq = 0.0f;
+        for (uint i = tid; i < D; i += THREADS) {
+            float v = static_cast<float>(vec_in[i]);
+            norm_sq += v * v;
+        }
+        norm_sq = simd_sum(norm_sq);
+        float vnorm = sqrt(norm_sq);
+        float inv_norm = (vnorm > 1e-8f) ? (1.0f / vnorm) : 0.0f;
+
+        if (tid == 0) {
+            vnorm_out[0] = static_cast<T>(vnorm);
+        }
+
+        // Step 2: Rotate normalized vector: y[i] = sum_j Pi[i,j] * x_norm[j]
+        // Step 3: Quantize each coordinate to nearest centroid and pack
+        // Step 4: Also compute y_hat (quantized rotated) for residual
+        float residual_norm_sq = 0.0f;
+
+        for (uint i = tid; i < D; i += THREADS) {
+            // Rotate: y_i = dot(Pi[i,:], x_norm)
+            float y_i = 0.0f;
+            for (uint j = 0; j < D; j++) {
+                y_i += static_cast<float>(Pi[i * D + j]) * static_cast<float>(vec_in[j]) * inv_norm;
+            }
+
+            // Find nearest centroid
+            uint best_c = 0;
+            float best_dist = 1e10f;
+            for (uint c = 0; c < N_LEVELS; c++) {
+                float dist = abs(y_i - centroids[c]);
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best_c = c;
+                }
+            }
+
+            // Pack index bits (atomic OR for thread safety)
+            uint bit_pos = i * BITS;
+            uint word = bit_pos / 32;
+            uint offset = bit_pos % 32;
+            atomic_fetch_or_explicit(
+                (device atomic_uint*)&idx_out[word],
+                (best_c << offset), memory_order_relaxed);
+            // Handle overflow across word boundary
+            if (offset + BITS > 32) {
+                uint overflow_bits = offset + BITS - 32;
+                atomic_fetch_or_explicit(
+                    (device atomic_uint*)&idx_out[word + 1],
+                    (best_c >> (BITS - overflow_bits)), memory_order_relaxed);
+            }
+
+            if (IS_KEY) {
+                // Compute x_hat[i] = dot(Pi^T[i,:], y_hat) = dot(Pi[:,i], y_hat)
+                // But we need the full y_hat vector for this...
+                // Instead, store y_hat_i = centroids[best_c] for use in residual
+                // We'll compute the residual in rotated space: r_rot = y - y_hat
+                // ||r||^2 = ||r_rot||^2 (rotation preserves norm)
+                float r_rot_i = y_i - centroids[best_c];
+                residual_norm_sq += r_rot_i * r_rot_i;
+
+                // QJL: project residual through S and take sign
+                // proj_i = dot(S[i,:], residual) = dot(S[i,:], Pi^T @ r_rot)
+                // Since S and Pi are both random, we can project r_rot directly
+                // through (S @ Pi^T) which is also random Gaussian
+                // For simplicity and correctness, project r_rot through S
+                // (this changes the projection matrix but preserves unbiasedness)
+                float proj_i = 0.0f;
+                for (uint j = 0; j < D; j++) {
+                    // We need residual in original space for exact match with fallback
+                    // residual_orig[k] = sum_j Pi^T[k,j] * r_rot[j] = sum_j Pi[j,k] * r_rot[j]
+                    // proj_i = sum_k S[i,k] * residual_orig[k]
+                    //        = sum_k S[i,k] * sum_j Pi[j,k] * r_rot[j]
+                    // This is a double loop which is too expensive per-thread.
+                    // Instead we project in rotated space: use S @ Pi^T as the projection
+                    proj_i += static_cast<float>(S[i * D + j]) * static_cast<float>(Pi[j * D + tid]);
+                    // This doesn't work either — we need the full r_rot vector.
+                }
+                // Fallback: just compute sign of S[i,:] @ r_rot directly
+                // We need all r_rot values, but each thread only computes one.
+                // This requires shared memory or a different approach.
+            }
+        }
+
+        if (IS_KEY) {
+            residual_norm_sq = simd_sum(residual_norm_sq);
+            if (tid == 0) {
+                rnorm_out[0] = static_cast<T>(sqrt(residual_norm_sq));
+            }
+        }
+    """
+
+    # The full QJL sign computation needs all residual values simultaneously,
+    # which is hard in a single-pass kernel without threadgroup memory.
+    # Use a practical two-kernel approach: kernel 1 does rotate+quantize+pack+norms,
+    # kernel 2 does QJL sign projection.
+    # For now, return None to use pure MLX fallback for encode.
+    # The attention_scores kernel is where the real speedup is.
+    return None
+
+
+def _make_attention_scores_kernel():
+    """
+    Compute attention scores directly on compressed keys.
+
+    Each thread processes one query against one key position.
+    The query rotation and projection are done in pure MLX (fast matmul),
+    then this kernel does the per-key scoring in packed space.
+    """
+    if not mx.metal.is_available():
+        return None
+
+    source = """
+        // Grid: (N_Q * N_K, 1, 1) — one thread per (query, key) pair
+        // Or better: grid.x = query index, grid.y = key block
+        uint q_idx = thread_position_in_grid.x;
+        uint k_idx = thread_position_in_grid.y;
+        uint tid = thread_position_in_threadgroup.x;
+
+        if (q_idx >= N_Q || k_idx >= N_K) return;
+
+        // q_rot and q_proj are pre-computed (rotated/projected queries)
+        const device T* q_rot_ptr = q_rot + q_idx * D;
+        const device T* q_proj_ptr = q_proj + q_idx * D;
+
+        const device uint32_t* k_idx_ptr = keys_idx + k_idx * IDX_STRIDE;
+        const device uint32_t* k_qjl_ptr = keys_qjl + k_idx * QJL_STRIDE;
+
+        // Term 1: dot(q_rot, codebook[idx]) — iterate over coordinates
+        float term1 = 0.0f;
+        for (uint i = 0; i < D; i++) {
+            uint bit_pos = i * BITS;
+            uint word = bit_pos / 32;
+            uint offset = bit_pos % 32;
+            uint mask = (1u << BITS) - 1u;
+            uint c_idx = (k_idx_ptr[word] >> offset) & mask;
+            if (offset + BITS > 32) {
+                uint overflow = offset + BITS - 32;
+                c_idx |= (k_idx_ptr[word + 1] << (BITS - overflow)) & mask;
+            }
+            term1 += static_cast<float>(q_rot_ptr[i]) * centroids[c_idx];
+        }
+
+        // Term 2: QJL popcount dot product
+        // Convert q_proj to sign bits, then XOR with stored signs
+        float qjl_dot = 0.0f;
+        for (uint w = 0; w < QJL_STRIDE; w++) {
+            uint32_t k_word = k_qjl_ptr[w];
+            uint32_t q_word = 0;
+            // Build q_proj sign bits for this word
+            for (uint b = 0; b < 32 && (w * 32 + b) < D; b++) {
+                float q_val = static_cast<float>(q_proj_ptr[w * 32 + b]);
+                if (q_val >= 0.0f) q_word |= (1u << b);
+            }
+            uint32_t xor_val = q_word ^ k_word;
+            int disagree = popcount(xor_val);
+            int bits_used = min(32u, D - w * 32);
+            qjl_dot += static_cast<float>(bits_used - 2 * disagree);
+        }
+
+        float alpha = static_cast<float>(keys_vnorm[k_idx]);
+        float gamma = static_cast<float>(keys_rnorm[k_idx]);
+        float corr_scale = static_cast<float>(correction_scale[0]);
+        float correction = corr_scale * gamma * qjl_dot;
+        float score = alpha * (term1 + correction);
+
+        out[q_idx * N_K + k_idx] = score;
+    """
+
+    return mx.fast.metal_kernel(
+        name="turboquant_attn_scores",
+        input_names=["q_rot", "q_proj", "keys_idx", "keys_qjl",
+                      "keys_vnorm", "keys_rnorm", "centroids", "correction_scale"],
+        output_names=["out"],
+        source=source,
+    )
+
+
+def _make_dequantize_values_kernel():
+    """Fused value dequantization: unpack indices -> lookup centroids -> inverse rotate -> scale."""
+    if not mx.metal.is_available():
+        return None
+
+    source = """
+        uint vec_id = thread_position_in_grid.x;
+        uint coord = thread_position_in_grid.y;
+
+        if (vec_id >= N || coord >= D) return;
+
+        const device uint32_t* idx_ptr = values_idx + vec_id * IDX_STRIDE;
+
+        // Unpack index for this coordinate
+        uint bit_pos = coord * BITS;
+        uint word = bit_pos / 32;
+        uint offset = bit_pos % 32;
+        uint mask = (1u << BITS) - 1u;
+        uint c_idx = (idx_ptr[word] >> offset) & mask;
+        if (offset + BITS > 32) {
+            uint overflow = offset + BITS - 32;
+            c_idx |= (idx_ptr[word + 1] << (BITS - overflow)) & mask;
+        }
+
+        // y_hat[coord] = centroids[c_idx]
+        // x_hat[coord_out] = sum_j Pi_v^T[coord_out, j] * y_hat[j] = sum_j Pi_v[j, coord_out] * y_hat[j]
+        // But we only have y_hat[coord], not the full vector.
+        // Each thread computes one ROTATED coordinate; we need cooperative inverse rotation.
+
+        // Alternative: each grid position is (vec_id, output_coord).
+        // output[coord] = vnorm * sum_j Pi_v[j, coord] * centroids[idx[j]]
+        float val = 0.0f;
+        for (uint j = 0; j < D; j++) {
+            // Unpack index for coordinate j
+            uint bp = j * BITS;
+            uint w = bp / 32;
+            uint off = bp % 32;
+            uint m = (1u << BITS) - 1u;
+            uint cj = (idx_ptr[w] >> off) & m;
+            if (off + BITS > 32) {
+                uint ov = off + BITS - 32;
+                cj |= (idx_ptr[w + 1] << (BITS - ov)) & m;
+            }
+            // Pi_v[j, coord] = Pi_v[j * D + coord]
+            val += static_cast<float>(Pi_v[j * D + coord]) * centroids[cj];
+        }
+
+        float vnorm = static_cast<float>(values_vnorm[vec_id]);
+        out[vec_id * D + coord] = static_cast<T>(val * vnorm);
+    """
+
+    return mx.fast.metal_kernel(
+        name="turboquant_dequant_values",
+        input_names=["values_idx", "values_vnorm", "Pi_v", "centroids"],
+        output_names=["out"],
+        source=source,
+    )
+
+
+# Initialize kernels at module load
+_attn_scores_kernel = _make_attention_scores_kernel()
+_dequant_values_kernel = _make_dequantize_values_kernel()
+
+
+# ---------------------------------------------------------------------------
+# Metal wrapper functions
+# ---------------------------------------------------------------------------
+
+def turboquant_inner_product_metal(
+    queries: mx.array,
+    compressed_keys: dict,
+    config: TurboQuantConfig,
+) -> mx.array:
+    """Compute attention scores using Metal kernel on compressed keys."""
+    if _attn_scores_kernel is None:
+        return turboquant_inner_product(queries, compressed_keys, config)
+
+    packed_idx = compressed_keys["idx"]
+    packed_qjl = compressed_keys["qjl"]
+    rnorm = compressed_keys["rnorm"]
+    vnorm = compressed_keys["vnorm"]
+
+    B, n_heads, L_k, idx_stride = packed_idx.shape
+    _, _, L_q, d = queries.shape
+    m = d
+    qjl_stride = packed_qjl.shape[-1]
+
+    dtype = queries.dtype
+    Pi = config.Pi_k.astype(dtype)
+    S = config.S.astype(dtype)
+
+    # Pre-rotate and pre-project queries in MLX (fast matmul)
+    q_rot = queries @ Pi.T      # (B, H, L_q, d)
+    q_proj = queries @ S.T      # (B, H, L_q, d)
+
+    # Flatten for kernel
+    N_Q = B * n_heads * L_q
+    N_K = L_k
+    flat_q_rot = q_rot.reshape(N_Q, d).astype(mx.float16)
+    flat_q_proj = q_proj.reshape(N_Q, d).astype(mx.float16)
+
+    # We need per-head key data. Reshape keys to (B*H, L_k, ...)
+    flat_k_idx = packed_idx.reshape(B * n_heads, L_k, idx_stride)
+    flat_k_qjl = packed_qjl.reshape(B * n_heads, L_k, qjl_stride)
+    flat_k_vnorm = vnorm.reshape(B * n_heads, L_k)
+    flat_k_rnorm = rnorm.reshape(B * n_heads, L_k)
+
+    corr_scale_arr = mx.array([math.sqrt(math.pi / 2) / m], dtype=mx.float32)
+
+    # Process each (batch, head) group
+    all_scores = []
+    for bh in range(B * n_heads):
+        k_idx_bh = flat_k_idx[bh]       # (L_k, idx_stride)
+        k_qjl_bh = flat_k_qjl[bh]       # (L_k, qjl_stride)
+        k_vnorm_bh = flat_k_vnorm[bh].astype(mx.float16)  # (L_k,)
+        k_rnorm_bh = flat_k_rnorm[bh].astype(mx.float16)  # (L_k,)
+
+        # Queries for this (batch, head): depends on L_q per head
+        q_start = bh * L_q
+        q_end = q_start + L_q
+        q_rot_bh = flat_q_rot[q_start:q_end]    # (L_q, d)
+        q_proj_bh = flat_q_proj[q_start:q_end]  # (L_q, d)
+
+        outputs = _attn_scores_kernel(
+            inputs=[q_rot_bh, q_proj_bh, k_idx_bh, k_qjl_bh,
+                    k_vnorm_bh, k_rnorm_bh, config.centroids_k, corr_scale_arr],
+            template=[
+                ("T", mx.float16),
+                ("D", d),
+                ("BITS", config.mse_bits),
+                ("IDX_STRIDE", idx_stride),
+                ("QJL_STRIDE", qjl_stride),
+                ("N_Q", L_q),
+                ("N_K", N_K),
+            ],
+            grid=(L_q, N_K, 1),
+            threadgroup=(1, 1, 1),
+            output_shapes=[(L_q, N_K)],
+            output_dtypes=[mx.float32],
+        )
+        all_scores.append(outputs[0])
+
+    scores = mx.stack(all_scores, axis=0)  # (B*H, L_q, L_k)
+    return scores.reshape(B, n_heads, L_q, L_k)
+
+
+def turboquant_decode_values_metal(
+    encoded: dict,
+    config: TurboQuantConfig,
+) -> mx.array:
+    """Decode values using Metal kernel."""
+    if _dequant_values_kernel is None:
+        return turboquant_decode_values(encoded, config)
+
+    packed_idx = encoded["idx"]
+    vnorm = encoded["vnorm"]
+    B, n_heads, seq_len, idx_stride = packed_idx.shape
+    d = config.head_dim
+
+    N = B * n_heads * seq_len
+    flat_idx = packed_idx.reshape(N, idx_stride)
+    flat_vnorm = vnorm.reshape(N).astype(mx.float16)
+
+    outputs = _dequant_values_kernel(
+        inputs=[flat_idx, flat_vnorm, config.Pi_v, config.centroids_v],
+        template=[
+            ("T", mx.float16),
+            ("D", d),
+            ("BITS", config.bits),
+            ("IDX_STRIDE", idx_stride),
+            ("N", N),
+        ],
+        grid=(N, d, 1),
+        threadgroup=(1, 1, 1),
+        output_shapes=[(N, d)],
+        output_dtypes=[mx.float16],
+    )
+
+    return outputs[0].reshape(B, n_heads, seq_len, d)
+
+
+# ---------------------------------------------------------------------------
+# Auto-dispatch: Metal if available, else pure MLX
+# ---------------------------------------------------------------------------
+
+def encode(x: mx.array, config: TurboQuantConfig, mode: str = "key") -> dict:
+    """Encode vectors. Uses pure MLX (Metal encode kernel deferred to v2)."""
+    return turboquant_encode(x, config, mode=mode)
+
+
+def decode_values(encoded: dict, config: TurboQuantConfig) -> mx.array:
+    """Decode values with auto Metal dispatch."""
+    if _dequant_values_kernel is not None:
+        return turboquant_decode_values_metal(encoded, config)
+    return turboquant_decode_values(encoded, config)
+
+
+def inner_product(
+    queries: mx.array, compressed: dict, config: TurboQuantConfig
+) -> mx.array:
+    """Compute inner products with auto Metal dispatch."""
+    if _attn_scores_kernel is not None:
+        return turboquant_inner_product_metal(queries, compressed, config)
+    return turboquant_inner_product(queries, compressed, config)

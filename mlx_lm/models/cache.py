@@ -8,7 +8,7 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 from .base import create_causal_mask
-from .turboquant import TurboQuantConfig, turboquant_encode, turboquant_decode_values
+from .turboquant import TurboQuantConfig, encode as tq_encode, decode_values as tq_decode_values
 
 
 def make_prompt_cache(
@@ -386,8 +386,8 @@ class TurboQuantKVCache(_BaseCache):
 
         prev = self.offset
 
-        enc_k = turboquant_encode(keys, self._config, mode="key")
-        enc_v = turboquant_encode(values, self._config, mode="value")
+        enc_k = tq_encode(keys, self._config, mode="key")
+        enc_v = tq_encode(values, self._config, mode="value")
 
         if self._keys_idx is None or (prev + num_steps) > self._keys_idx.shape[2]:
             n_alloc = ((self.step + num_steps - 1) // self.step) * self.step
@@ -575,7 +575,7 @@ class KVCache(_BaseCache):
         return quant_cache
 
     def to_turboquant(self, bits: int = 3, seed: int = 42):
-        from .turboquant import TurboQuantConfig, turboquant_encode
+        from .turboquant import TurboQuantConfig, encode as tq_encode
         tq_cache = TurboQuantKVCache(bits=bits, seed=seed)
         if self.keys is not None:
             keys = self.keys[..., :self.offset, :]

@@ -112,7 +112,7 @@ def turboquant_scaled_dot_product_attention(
     mask: Optional[mx.array],
 ) -> mx.array:
     """Compute attention using TurboQuant-compressed KV cache."""
-    from .turboquant import turboquant_inner_product, turboquant_decode_values
+    from .turboquant import inner_product as tq_inner_product, decode_values as tq_decode_values
 
     config = cache._config
     compressed_keys = cache.get_compressed_keys()
@@ -129,7 +129,7 @@ def turboquant_scaled_dot_product_attention(
         q_for_ip = queries
 
     # Compute attention scores in compressed space
-    scores = turboquant_inner_product(q_for_ip, compressed_keys, config)
+    scores = tq_inner_product(q_for_ip, compressed_keys, config)
     scores = scores * scale
 
     if n_repeats > 1:
@@ -150,7 +150,7 @@ def turboquant_scaled_dot_product_attention(
     weights = mx.softmax(scores, axis=-1, precise=True)
 
     # Decode values
-    values = turboquant_decode_values(compressed_values, config)
+    values = tq_decode_values(compressed_values, config)
 
     if n_repeats > 1:
         values = mx.expand_dims(values, axis=-3)
