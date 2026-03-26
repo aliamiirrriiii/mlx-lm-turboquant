@@ -288,3 +288,70 @@ def turboquant_decode_values(
 
     # Rescale by original norm
     return x_hat * vnorm.astype(mx.float16)
+
+
+def turboquant_inner_product(
+    queries: mx.array,
+    compressed_keys: dict,
+    config: TurboQuantConfig,
+) -> mx.array:
+    """
+    Compute unbiased inner product estimates: <q, k> for each query-key pair.
+
+    Uses: alpha_k * [<Pi@q, codebook[idx]> + gamma * sqrt(pi/2) / m * <S@q, qjl>]
+
+    Args:
+        queries: (B, n_heads, L_q, head_dim)
+        compressed_keys: dict from turboquant_encode with mode="key"
+        config: TurboQuantConfig
+
+    Returns:
+        scores: (B, n_heads, L_q, L_k)
+    """
+    packed_idx = compressed_keys["idx"]
+    packed_qjl = compressed_keys["qjl"]
+    rnorm = compressed_keys["rnorm"]
+    vnorm = compressed_keys["vnorm"]
+
+    B, n_heads, L_k, _ = packed_idx.shape
+    _, _, L_q, d = queries.shape
+    m = d  # QJL projection dimension = head_dim
+
+    dtype = queries.dtype
+    Pi = config.Pi_k.astype(dtype)
+    S = config.S.astype(dtype)
+    c = config.centroids_k.astype(dtype)
+
+    # Unpack key indices: (B*H*L_k, d) -> (B, H, L_k, d)
+    flat_idx = packed_idx.reshape(-1, packed_idx.shape[-1])
+    key_indices = unpack_indices(flat_idx, bits=config.mse_bits, dim=d)
+    key_indices = key_indices.reshape(B, n_heads, L_k, d)
+
+    # Unpack QJL signs: (B*H*L_k, m) -> (B, H, L_k, m)
+    flat_qjl = packed_qjl.reshape(-1, packed_qjl.shape[-1])
+    key_signs = unpack_signs(flat_qjl, dim=m)
+    key_signs = key_signs.reshape(B, n_heads, L_k, m)
+
+    # Pre-rotate query: q_rot = q @ Pi^T (same rotation as encode)
+    q_rot = queries @ Pi.T
+
+    # Term 1: <q_rot, codebook[idx]> for each query-key pair
+    key_centroids = c[key_indices]  # (B, H, L_k, d)
+    # (B, H, L_q, d) @ (B, H, d, L_k) -> (B, H, L_q, L_k)
+    term1 = q_rot @ key_centroids.swapaxes(-2, -1)
+
+    # Term 2: QJL correction
+    # q_proj = q @ S^T -> (B, H, L_q, m)
+    q_proj = queries @ S.T
+    # (B, H, L_q, m) @ (B, H, m, L_k) -> (B, H, L_q, L_k)
+    qjl_dot = q_proj @ key_signs.swapaxes(-2, -1)
+
+    correction_scale = math.sqrt(math.pi / 2) / m
+    # rnorm: (B, H, L_k, 1) -> (B, H, 1, L_k)
+    rnorm_t = rnorm.astype(dtype).swapaxes(-2, -1)
+    term2 = correction_scale * rnorm_t * qjl_dot
+
+    # Scale by key vector norm: vnorm (B, H, L_k, 1) -> (B, H, 1, L_k)
+    vnorm_t = vnorm.astype(dtype).swapaxes(-2, -1)
+
+    return vnorm_t * (term1 + term2)

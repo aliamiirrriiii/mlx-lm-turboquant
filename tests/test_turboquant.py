@@ -3,7 +3,7 @@ import pytest
 
 from mlx_lm.models.turboquant import generate_qjl_matrix, generate_rotation_matrix, solve_lloyd_max
 from mlx_lm.models.turboquant import pack_indices, unpack_indices, pack_signs, unpack_signs
-from mlx_lm.models.turboquant import turboquant_encode, turboquant_decode_values, TurboQuantConfig
+from mlx_lm.models.turboquant import turboquant_encode, turboquant_decode_values, TurboQuantConfig, turboquant_inner_product
 
 
 def test_placeholder():
@@ -150,3 +150,43 @@ class TestEncodeDecode:
         norms = mx.linalg.norm(x, axis=-1, keepdims=True)
         encoded = turboquant_encode(x, config, mode="key")
         assert mx.allclose(encoded["vnorm"], norms.astype(mx.float16), atol=0.5).item()
+
+
+class TestInnerProduct:
+    @pytest.fixture
+    def config(self):
+        return TurboQuantConfig(head_dim=128, bits=3, seed=42)
+
+    def test_inner_product_unbiased(self, config):
+        """Over many random pairs, estimated inner product should match true inner product on average."""
+        mx.random.seed(0)
+        n_trials = 1000
+        queries = mx.random.normal((1, 1, n_trials, 128))
+        keys = mx.random.normal((1, 1, n_trials, 128))
+
+        true_ip = mx.sum(queries * keys, axis=-1)  # (1, 1, n_trials)
+
+        compressed = turboquant_encode(keys, config, mode="key")
+
+        # For unbiasedness test, we need per-vector inner products
+        # estimated_ip[i] = <queries[i], compressed_keys[i]>
+        # We can compute this as diagonal of the full score matrix
+        scores = turboquant_inner_product(queries, compressed, config)
+        # scores is (1, 1, n_trials, n_trials) - take diagonal
+        estimated_ip = mx.diagonal(scores.squeeze(0).squeeze(0))  # (n_trials,)
+        true_ip_flat = true_ip.squeeze(0).squeeze(0)  # (n_trials,)
+
+        mean_true = mx.mean(mx.abs(true_ip_flat)).item()
+        mean_error = mx.mean(mx.abs(estimated_ip - true_ip_flat)).item()
+        relative_error = mean_error / mean_true
+        assert relative_error < 0.5  # < 50% mean abs error at 3-bit (2-bit MSE + 1-bit QJL)
+        # The estimator IS unbiased; verify low bias (mean signed error near zero)
+        mean_bias = mx.mean(estimated_ip - true_ip_flat).item()
+        assert abs(mean_bias) / mean_true < 0.05  # bias < 5% of signal magnitude
+
+    def test_inner_product_shape(self, config):
+        queries = mx.random.normal((1, 4, 1, 128))
+        keys = mx.random.normal((1, 4, 16, 128))
+        compressed = turboquant_encode(keys, config, mode="key")
+        scores = turboquant_inner_product(queries, compressed, config)
+        assert scores.shape == (1, 4, 1, 16)  # (B, n_heads, L_q, L_k)
