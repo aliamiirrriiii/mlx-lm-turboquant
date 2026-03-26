@@ -1,0 +1,70 @@
+{
+  "mlx-community/Qwen3.5-9B-MLX-4bit": {
+    "model": "mlx-community/Qwen3.5-9B-MLX-4bit",
+    "layers": 32,
+    "memory": {
+      "256": {
+        "standard_mb": 33.12,
+        "turboquant_mb": 48.72,
+        "ratio": 0.68
+      },
+      "1024": {
+        "standard_mb": 57.12,
+        "turboquant_mb": 53.55,
+        "ratio": 1.07
+      },
+      "4096": {
+        "standard_mb": 153.12,
+        "turboquant_mb": 72.86,
+        "ratio": 2.1
+      }
+    },
+    "speed": {
+      "standard": {
+        "tok_per_sec": 45.6,
+        "cache_mb": 33.12,
+        "tokens_generated": 50
+      },
+      "turboquant": {
+        "tok_per_sec": 19.6,
+        "cache_mb": 48.72,
+        "tokens_generated": 50
+      }
+    },
+    "speed_ratio": 0.43
+  },
+  "mlx-community/Qwen3.5-27B-4bit": {
+    "model": "mlx-community/Qwen3.5-27B-4bit",
+    "layers": 64,
+    "memory": {
+      "256": {
+        "standard_mb": 90.81,
+        "turboquant_mb": 148.17,
+        "ratio": 0.61
+      },
+      "1024": {
+        "standard_mb": 138.81,
+        "turboquant_mb": 157.82,
+        "ratio": 0.88
+      },
+      "4096": {
+        "standard_mb": 330.81,
+        "turboquant_mb": 196.45,
+        "ratio": 1.68
+      }
+    },
+    "speed": {
+      "standard": {
+        "tok_per_sec": 14.0,
+        "cache_mb": 90.81,
+        "tokens_generated": 50
+      },
+      "turboquant": {
+        "tok_per_sec": 9.0,
+        "cache_mb": 148.17,
+        "tokens_generated": 50
+      }
+    },
+    "speed_ratio": 0.64
+  }
+}
