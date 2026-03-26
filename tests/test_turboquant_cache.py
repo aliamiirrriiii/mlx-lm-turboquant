@@ -205,3 +205,113 @@ class TestCLIIntegration:
         model = MockModel()
         with pytest.raises(ValueError, match="mutually exclusive"):
             make_prompt_cache(model, max_kv_size=1024, kv_cache_type="turboquant")
+
+
+class TestEndToEnd:
+    def test_generation_simulation_with_turboquant(self):
+        """Simulate generating tokens using TurboQuant KV cache."""
+        from mlx_lm.models.cache import TurboQuantKVCache
+        from mlx_lm.models.base import scaled_dot_product_attention
+
+        B, n_heads, d = 1, 4, 128
+        cache = TurboQuantKVCache(bits=3, seed=42)
+
+        # Prefill with 16 tokens
+        keys = mx.random.normal((B, n_heads, 16, d))
+        values = mx.random.normal((B, n_heads, 16, d))
+        cache.update_and_fetch(keys, values)
+        assert cache.offset == 16
+
+        # Generate 4 more tokens one at a time
+        for i in range(4):
+            query = mx.random.normal((B, n_heads, 1, d))
+            new_key = mx.random.normal((B, n_heads, 1, d))
+            new_value = mx.random.normal((B, n_heads, 1, d))
+            cache.update_and_fetch(new_key, new_value)
+
+            output = scaled_dot_product_attention(
+                query, cache, cache, cache=cache, scale=d**-0.5, mask=None
+            )
+            assert output.shape == (B, n_heads, 1, d)
+            assert not mx.any(mx.isnan(output)).item()
+
+        assert cache.offset == 20
+
+    def test_memory_reduction(self):
+        """Verify TurboQuant uses less memory than standard KVCache."""
+        from mlx_lm.models.cache import KVCache, TurboQuantKVCache
+
+        B, n_heads, seq_len, d = 1, 8, 512, 128
+        keys = mx.random.normal((B, n_heads, seq_len, d))
+        values = mx.random.normal((B, n_heads, seq_len, d))
+
+        std_cache = KVCache()
+        std_cache.update_and_fetch(keys, values)
+        std_bytes = std_cache.nbytes
+
+        tq_cache = TurboQuantKVCache(bits=3, seed=42)
+        tq_cache.update_and_fetch(keys, values)
+        tq_bytes = tq_cache.nbytes
+
+        ratio = std_bytes / tq_bytes
+        print(f"Standard: {std_bytes} bytes, TurboQuant: {tq_bytes} bytes, ratio: {ratio:.2f}x")
+        assert ratio > 2.0  # At least 2x compression (conservative)
+
+    def test_trim_then_generate(self):
+        """Test that trimming works and generation continues correctly."""
+        from mlx_lm.models.cache import TurboQuantKVCache
+        from mlx_lm.models.base import scaled_dot_product_attention
+
+        B, n_heads, d = 1, 4, 128
+        cache = TurboQuantKVCache(bits=3, seed=42)
+
+        # Prefill 10 tokens
+        keys = mx.random.normal((B, n_heads, 10, d))
+        values = mx.random.normal((B, n_heads, 10, d))
+        cache.update_and_fetch(keys, values)
+        assert cache.offset == 10
+
+        # Trim 3
+        cache.trim(3)
+        assert cache.offset == 7
+
+        # Generate 1 more token
+        new_k = mx.random.normal((B, n_heads, 1, d))
+        new_v = mx.random.normal((B, n_heads, 1, d))
+        cache.update_and_fetch(new_k, new_v)
+        assert cache.offset == 8
+
+        query = mx.random.normal((B, n_heads, 1, d))
+        output = scaled_dot_product_attention(
+            query, cache, cache, cache=cache, scale=d**-0.5, mask=None
+        )
+        assert output.shape == (B, n_heads, 1, d)
+        assert not mx.any(mx.isnan(output)).item()
+
+    def test_kvcache_to_turboquant_preserves_behavior(self):
+        """Converting KVCache to TurboQuantKVCache should produce similar attention output."""
+        from mlx_lm.models.cache import KVCache, TurboQuantKVCache
+        from mlx_lm.models.base import scaled_dot_product_attention
+
+        mx.random.seed(123)
+        B, n_heads, seq_len, d = 1, 4, 32, 128
+        keys = mx.random.normal((B, n_heads, seq_len, d))
+        values = mx.random.normal((B, n_heads, seq_len, d))
+        queries = mx.random.normal((B, n_heads, 1, d))
+        scale = d**-0.5
+
+        # Standard attention
+        std_cache = KVCache()
+        std_cache.update_and_fetch(keys, values)
+        k_out, v_out = std_cache.keys[..., :std_cache.offset, :], std_cache.values[..., :std_cache.offset, :]
+        ref = mx.fast.scaled_dot_product_attention(queries, k_out, v_out, scale=scale, mask=None)
+
+        # Convert to TurboQuant and compute
+        tq_cache = std_cache.to_turboquant(bits=3, seed=42)
+        tq_out = scaled_dot_product_attention(
+            queries, tq_cache, tq_cache, cache=tq_cache, scale=scale, mask=None
+        )
+
+        cos_sim = mx.sum(ref * tq_out) / (mx.linalg.norm(ref) * mx.linalg.norm(tq_out) + 1e-8)
+        print(f"KVCache->TurboQuant cosine similarity: {cos_sim.item():.4f}")
+        assert cos_sim.item() > 0.80
