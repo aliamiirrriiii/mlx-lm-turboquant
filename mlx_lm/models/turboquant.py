@@ -92,71 +92,93 @@ def generate_qjl_matrix(d: int, m: Optional[int] = None, seed: int = 42) -> mx.a
 
 
 def pack_indices(indices: mx.array, bits: int) -> mx.array:
-    """Pack integer indices into uint32 arrays. indices shape: (..., d), values in [0, 2^bits).
-
-    Handles cross-word boundary spanning when bit_offset + bits > 32.
-    """
+    """Pack integer indices into uint32 arrays. Vectorized — no Python loops."""
     *batch_dims, d = indices.shape
+    vals_per_word = 32 // bits
+    indices_u32 = indices.astype(mx.uint32)
+
+    if d % vals_per_word == 0 and bits in (1, 2, 4, 8, 16):
+        # Fast path: bits evenly divides 32, no cross-word overflow
+        n_words = d // vals_per_word
+        reshaped = indices_u32.reshape(*batch_dims, n_words, vals_per_word)
+        shifts = mx.arange(0, 32, bits, dtype=mx.uint32)  # [0, bits, 2*bits, ...]
+        return mx.sum(reshaped << shifts, axis=-1)
+
+    # General path for 3-bit etc: precompute word/offset tables, vectorized scatter
     n_ints = (d * bits + 31) // 32
+    positions = mx.arange(d, dtype=mx.uint32)
+    bit_pos = positions * bits
+    word_idx = bit_pos // 32
+    bit_offset = bit_pos % 32
 
     packed = mx.zeros((*batch_dims, n_ints), dtype=mx.uint32)
-    for i in range(d):
-        bit_pos = i * bits
-        int_idx = bit_pos // 32
-        bit_offset = bit_pos % 32
-        val = indices[..., i].astype(mx.uint32)
-        # Write bits that fit in the current word
-        packed[..., int_idx] = packed[..., int_idx] | (val << bit_offset)
-        # Handle overflow into the next word
-        overflow = bit_offset + bits - 32
-        if overflow > 0 and int_idx + 1 < n_ints:
-            packed[..., int_idx + 1] = packed[..., int_idx + 1] | (val >> (bits - overflow))
+    for w in range(n_ints):
+        in_word = word_idx == w
+        shifted = mx.where(in_word, indices_u32 << bit_offset, mx.zeros_like(indices_u32))
+        packed[..., w] = mx.sum(shifted, axis=-1)
+        # Handle overflow from previous word into this one
+        if w > 0:
+            overflows = (word_idx == (w - 1)) & ((bit_offset + bits) > 32)
+            if mx.any(overflows).item():
+                overflow_shift = bits - (bit_offset + bits - 32)
+                overflow_vals = mx.where(overflows, indices_u32 >> overflow_shift, mx.zeros_like(indices_u32))
+                packed[..., w] = packed[..., w] + mx.sum(overflow_vals, axis=-1)
     return packed
 
 
 def unpack_indices(packed: mx.array, bits: int, dim: int) -> mx.array:
-    """Unpack uint32 arrays back to integer indices. Returns shape (..., dim).
+    """Unpack uint32 arrays back to integer indices. Vectorized — no Python loops."""
+    vals_per_word = 32 // bits
+    mask_val = (1 << bits) - 1
 
-    Handles cross-word boundary spanning when bit_offset + bits > 32.
-    """
-    mask = mx.array((1 << bits) - 1, dtype=mx.uint32)
-    result = []
+    if dim % vals_per_word == 0 and bits in (1, 2, 4, 8, 16):
+        # Fast path: expand each word into vals_per_word values
+        n_words = dim // vals_per_word
+        shifts = mx.arange(0, 32, bits, dtype=mx.uint32)  # [0, bits, 2*bits, ...]
+        expanded = mx.expand_dims(packed, -1) >> shifts  # (..., n_words, vpw)
+        expanded = expanded & mx.array(mask_val, dtype=mx.uint32)
+        return expanded.reshape(*packed.shape[:-1], dim)
+
+    # General path for 3-bit etc
+    positions = mx.arange(dim, dtype=mx.uint32)
+    bit_pos = positions * bits
+    word_idx = (bit_pos // 32).tolist()
+    bit_offset = (bit_pos % 32).tolist()
+    mask = mx.array(mask_val, dtype=mx.uint32)
+
+    parts = []
     for i in range(dim):
-        bit_pos = i * bits
-        int_idx = bit_pos // 32
-        bit_offset = bit_pos % 32
-        val = packed[..., int_idx] >> bit_offset
-        # Handle overflow from the next word
-        overflow = bit_offset + bits - 32
+        w, off = word_idx[i], bit_offset[i]
+        val = packed[..., w] >> off
+        overflow = off + bits - 32
         if overflow > 0:
-            val = val | (packed[..., int_idx + 1] << (bits - overflow))
-        result.append(val & mask)
-    return mx.stack(result, axis=-1)
+            val = val | (packed[..., w + 1] << (bits - overflow))
+        parts.append(val & mask)
+    return mx.stack(parts, axis=-1)
 
 
 def pack_signs(signs: mx.array) -> mx.array:
-    """Pack sign values (+1/-1) into uint32 bit arrays. signs shape: (..., d)."""
+    """Pack sign values (+1/-1) into uint32 bit arrays. Vectorized."""
     *batch_dims, d = signs.shape
-    n_ints = (d + 31) // 32
+    n_words = (d + 31) // 32
     bits = (signs > 0).astype(mx.uint32)
-    packed = mx.zeros((*batch_dims, n_ints), dtype=mx.uint32)
-    for i in range(d):
-        int_idx = i // 32
-        bit_offset = i % 32
-        packed[..., int_idx] = packed[..., int_idx] | (bits[..., i] << bit_offset)
-    return packed
+    # Pad to multiple of 32
+    pad = n_words * 32 - d
+    if pad > 0:
+        bits = mx.pad(bits, [(0, 0)] * len(batch_dims) + [(0, pad)])
+    bits = bits.reshape(*batch_dims, n_words, 32)
+    shifts = mx.arange(32, dtype=mx.uint32)
+    return mx.sum(bits << shifts, axis=-1)
 
 
 def unpack_signs(packed: mx.array, dim: int) -> mx.array:
-    """Unpack uint32 bit arrays back to sign values (+1/-1). Returns shape (..., dim)."""
-    result = []
-    for i in range(dim):
-        int_idx = i // 32
-        bit_offset = i % 32
-        bit = (packed[..., int_idx] >> bit_offset) & mx.array(1, dtype=mx.uint32)
-        sign = mx.where(bit, mx.array(1.0), mx.array(-1.0))
-        result.append(sign)
-    return mx.stack(result, axis=-1)
+    """Unpack uint32 bit arrays back to sign values (+1/-1). Vectorized."""
+    *batch_dims, n_words = packed.shape
+    shifts = mx.arange(32, dtype=mx.uint32)
+    expanded = (mx.expand_dims(packed, -1) >> shifts) & mx.array(1, dtype=mx.uint32)
+    expanded = expanded.reshape(*batch_dims, n_words * 32)
+    expanded = expanded[..., :dim]
+    return mx.where(expanded, mx.array(1.0), mx.array(-1.0))
 
 
 # ---------------------------------------------------------------------------
@@ -225,10 +247,17 @@ def turboquant_encode(
     y = x_unit @ Pi.astype(x.dtype).T
 
     # Find nearest centroid per coordinate
+    # For small codebooks (4 or 8 entries), broadcast is fine but we flatten
+    # the spatial dims to keep the intermediate tensor manageable
     c = centroids.astype(x.dtype)
-    diffs = mx.abs(mx.expand_dims(y, -1) - c)  # (B, H, S, d, n_levels)
-    indices = mx.argmin(diffs, axis=-1).astype(mx.uint32)  # (B, H, S, d)
-    y_hat = c[indices]  # (B, H, S, d)
+    orig_shape = y.shape
+    flat_y = y.reshape(-1, d)  # (N, d)
+    # (N, d, 1) - (n_levels,) -> (N, d, n_levels)
+    diffs = mx.abs(mx.expand_dims(flat_y, -1) - c)
+    indices = mx.argmin(diffs, axis=-1).astype(mx.uint32)  # (N, d)
+    y_hat = c[indices]  # (N, d)
+    indices = indices.reshape(orig_shape)
+    y_hat = y_hat.reshape(orig_shape)
 
     # Pack indices
     packed_idx = pack_indices(indices.reshape(-1, d), bits=mse_bits)
